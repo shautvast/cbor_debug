@@ -3,50 +3,57 @@ use crate::MajorType::*;
 
 
 pub fn decode(bytes: &[u8]) -> String {
-    format!("{:?}", decode_at(bytes, 0))
-}
-
-fn decode_at(bytes: &[u8], mut idx: usize) -> Vec<MajorType> {
     let mut output = Vec::new();
-
+    let mut idx = 0;
     while idx < bytes.len() {
-        output.push(decode_one_at(bytes, &mut idx));
+        output.push(decode_at(bytes, &mut idx));
         idx += 1;
     }
-    output
+    format!("{:?}", output)
 }
 
-fn decode_one_at(bytes: &[u8], mut idx: &mut usize) -> MajorType {
+fn decode_at(bytes: &[u8], mut idx: &mut usize) -> MajorType {
     let major_type = (bytes[*idx] & 0b11100000) >> 5;
 
     match major_type {
-        0 => get_intval(&bytes, idx).map(|v| U(v)).unwrap_or(Invalid),
-        1 => get_intval(&bytes, idx).map(|v| N(-1 - (v as i128))).unwrap_or(Invalid),
+        0 => get_int(&bytes, idx).map(|v| U(v)).unwrap_or(Invalid),
+        1 => get_int(&bytes, idx).map(|v| N(-1 - (v as i128))).unwrap_or(Invalid),
         2 => {
-            let len = get_intval(&bytes, &mut idx).unwrap() as usize;
+            let len = get_int(&bytes, &mut idx).unwrap() as usize;
             let byte_string = bytes[*idx..*idx + len].to_vec();
             *idx += len;
             BStr(byte_string)
         }
         3 => {
-            let len = get_intval(&bytes, idx).unwrap() as usize;
+            let len = get_int(&bytes, idx).unwrap() as usize;
             let utf = bytes[*idx..*idx + len].to_vec();
             *idx += len;
             Str(String::from_utf8(utf).unwrap())
         }
         4 => {
-            let len = get_intval(&bytes, idx).unwrap() as usize;
+            let len = get_int(&bytes, idx).unwrap() as usize;
             let mut array: Vec<MajorType> = Vec::new();
             for _ in 0..len {
-                array.push(decode_one_at(bytes, idx));
+                array.push(decode_at(bytes, idx));
             }
             Arr(array)
         }
         5 => Map(HashMap::new()),
         6 => Tag,
         7 => {
+            let additional = bytes[*idx] & 0b00011111;
+            let out = match additional {
+                20 => False,
+                21 => True,
+                22 => Null,
+                23 => Undefined,
+                25 => F16(get_f16(&bytes, idx)),
+                26 => F32(get_f32(&bytes, idx)),
+                27 => F64(get_f64(&bytes, idx)),
+                _ => Invalid
+            };
             *idx += 1;
-            Div
+            out
         }
         _ => {
             Invalid
@@ -54,14 +61,34 @@ fn decode_one_at(bytes: &[u8], mut idx: &mut usize) -> MajorType {
     }
 }
 
-fn get_intval(bytes: &[u8], i: &mut usize) -> Option<u64> {
-    let next = bytes[*i] & 0b00011111;
-    if next < 24 {
+fn get_f16(bytes: &[u8], idx: &mut usize) -> f32 {
+    let b1 = bytes[*idx + 1];
+    let b2 = bytes[*idx + 2];
+    *idx += 2;
+    let sign = if (b1 & 0b10000000) == 0 { 1.0_f32 } else { -1.0_f32 };
+    let exponent = ((b1 & 0b01111100) >> 2) as i32 - 15;
+    let fraction = ((((b1 & 0b00000011) as u16) << 8) + b2 as u16) as f32;
+    2.0_f32.powi(exponent) * (1.0_f32 + fraction / 1024_f32) * sign
+}
+
+fn get_f32(bytes: &[u8], idx: &mut usize) -> f32 {
+    *idx += 4;
+    f32::from_be_bytes(to_b4(&bytes[*idx - 3..=*idx]))
+}
+
+fn get_f64(bytes: &[u8], idx: &mut usize) -> f64 {
+    *idx += 8;
+    f64::from_be_bytes(to_b8(&bytes[*idx - 7..=*idx]))
+}
+
+fn get_int(bytes: &[u8], i: &mut usize) -> Option<u64> {
+    let additional = bytes[*i] & 0b00011111;
+    if additional < 24 {
         *i += 1;
-        Some(next as u64)
+        Some(additional as u64)
     } else {
-        if next < 28 {
-            let nbytes = 1 << (next - 24);
+        if additional < 28 {
+            let nbytes = 1 << (additional - 24);
 
             let int_val = u64::from_be_bytes(to_b8(&bytes[*i + 1..=*i + nbytes]));
             *i += nbytes + 1;
@@ -75,14 +102,20 @@ fn get_intval(bytes: &[u8], i: &mut usize) -> Option<u64> {
 #[derive(Debug)]
 #[repr(u8)]
 enum MajorType {
-    U(u64) = 0,
-    N(i128) = 1,
-    BStr(Vec<u8>) = 2,
-    Str(String) = 3,
-    Arr(Vec<MajorType>) = 4,
-    Map(HashMap<String, MajorType>) = 5,
-    Tag = 6,
-    Div = 7,
+    U(u64),
+    N(i128),
+    BStr(Vec<u8>),
+    Str(String),
+    Arr(Vec<MajorType>),
+    Map(HashMap<String, MajorType>),
+    Tag,
+    False,
+    True,
+    Null,
+    Undefined,
+    F16(f32),
+    F32(f32),
+    F64(f64),
     Invalid,
 }
 
@@ -90,6 +123,14 @@ fn to_b8(bytes: &[u8]) -> [u8; 8] {
     let mut out = [0_u8; 8];
     for (i, b) in bytes.iter().enumerate() {
         out[8 - bytes.len() + i] = *b;
+    }
+    out
+}
+
+fn to_b4(bytes: &[u8]) -> [u8; 4] {
+    let mut out = [0_u8; 4];
+    for (i, b) in bytes.iter().enumerate() {
+        out[4 - bytes.len() + i] = *b;
     }
     out
 }
@@ -127,6 +168,21 @@ mod test {
     }
 
     #[test]
+    fn float16() {
+        assert_eq!("[F16(1.0009766)]", decode(&[249, 60, 1]));
+    }
+
+    #[test]
+    fn float32() {
+        assert_eq!("[F32(1.0)]", decode(&to_vec(1.0_f32).unwrap()));
+    }
+
+    #[test]
+    fn float64() {
+        assert_eq!("[F64(10088000023.10022)]", decode(&to_vec(10088000023.10022_f64).unwrap()));
+    }
+
+    #[test]
     fn bytestring() {
         assert_eq!(format!("[BStr([1, 2, 3, 4, 5])]"), decode(&[0b01000101, 1, 2, 3, 4, 5]));
     }
@@ -156,12 +212,12 @@ mod test {
         struct Simple {
             #[n(1)] name: String,
         }
-        assert_eq!(format!("[Arr([Div, Str(\"foobar\")])]"), decode(&to_vec(Simple { name: "foobar".into() }).unwrap()));
+        assert_eq!(format!("[Arr([Null, Str(\"foobar\")])]"), decode(&to_vec(Simple { name: "foobar".into() }).unwrap()));
     }
 
     #[test]
     fn enum_1() {
-        assert_eq!(format!("[Arr([U(1), Arr([Div, Str(\"foo\")])])]"), decode(
+        assert_eq!(format!("[Arr([U(1), Arr([Null, Str(\"foo\")])])]"), decode(
             &to_vec(
                 Simple::Left("foo".into())
             ).unwrap()));
@@ -169,7 +225,7 @@ mod test {
 
     #[test]
     fn enum_vec() {
-        assert_eq!(format!("[Arr([Arr([U(1), Arr([Div, Str(\"foo\")])]), Arr([U(2), Arr([Div, Str(\"bar\")])])])]"), decode(
+        assert_eq!(format!("[Arr([Arr([U(1), Arr([Null, Str(\"foo\")])]), Arr([U(2), Arr([Null, Str(\"bar\")])])])]"), decode(
             &to_vec(
                 vec![Simple::Left("foo".into()),
                      Simple::Right("bar".into())],
